@@ -1,5 +1,5 @@
 import streamlit as st
-import anthropic
+import google.generativeai as genai
 import fitz  # PyMuPDF
 import gspread
 from google.oauth2.service_account import Credentials
@@ -11,7 +11,6 @@ import os
 import io
 import base64
 import re
-from datetime import datetime
 from dotenv import load_dotenv
 
 # ── Load environment variables (works locally) ──────────────────────────────
@@ -24,8 +23,8 @@ def get_secret(key, default=""):
     except Exception:
         return os.getenv(key, default)
 
-ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY")
-GOOGLE_SHEET_ID   = get_secret("GOOGLE_SHEET_ID")
+GEMINI_API_KEY  = get_secret("GEMINI_API_KEY")
+GOOGLE_SHEET_ID = get_secret("GOOGLE_SHEET_ID")
 
 SHEET_HEADERS = ["Date", "Name", "Topic", "Assessment", "Marks", "Percentage", "Feedback/Remarks"]
 
@@ -50,14 +49,6 @@ st.markdown("""
     }
     .main-header h1 { font-size: 2.2rem; margin: 0; }
     .main-header p  { font-size: 1rem; margin: 0.5rem 0 0; opacity: 0.85; }
-    .result-card {
-        background: #f8faff;
-        border: 1px solid #dce8f8;
-        border-left: 4px solid #2d6a9f;
-        border-radius: 8px;
-        padding: 1.2rem 1.5rem;
-        margin: 0.8rem 0;
-    }
     .success-card {
         background: #f0fff4;
         border-left: 4px solid #28a745;
@@ -98,33 +89,24 @@ st.markdown("""
 #  HELPERS
 # ════════════════════════════════════════════════════════════════════
 
-def pdf_to_base64_images(pdf_bytes: bytes) -> list:
-    """Convert every page of a PDF to a base64-encoded PNG string."""
+def pdf_to_images(pdf_bytes: bytes) -> list:
+    """Convert every PDF page to PNG bytes for Gemini."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
     for page in doc:
         mat = fitz.Matrix(2.0, 2.0)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        png = pix.tobytes("png")
-        images.append(base64.standard_b64encode(png).decode())
+        images.append(pix.tobytes("png"))
     doc.close()
     return images
 
 
-def extract_and_grade_with_claude(images_b64: list, api_key: str) -> dict:
-    """Send all PDF pages to Claude Vision. Claude extracts metadata AND grades answers."""
-    client = anthropic.Anthropic(api_key=api_key)
+def extract_and_grade_with_gemini(image_bytes_list: list, api_key: str) -> dict:
+    """Send all PDF pages to Gemini Vision. Gemini extracts metadata AND grades answers."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
-    content = []
-    for img in images_b64:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/png", "data": img}
-        })
-
-    content.append({
-        "type": "text",
-        "text": """You are an expert technical assessor for an IT training organization.
+    prompt = """You are an expert technical assessor for an IT training organization.
 
 You will receive images of a scanned intern assessment answer sheet (could be handwritten or printed).
 
@@ -150,7 +132,7 @@ Your tasks:
 
 5. Write overall_feedback summarizing performance (2-3 sentences).
 
-Respond ONLY with a valid JSON object in this exact format:
+Respond ONLY with a valid JSON object in this exact format (no markdown, no extra text):
 {
   "date": "DD-MM-YYYY",
   "intern_name": "Full Name",
@@ -174,16 +156,22 @@ Respond ONLY with a valid JSON object in this exact format:
 }
 
 If you cannot read a field, use "Unknown" for strings and 0 for numbers.
-Return ONLY the JSON, no markdown, no explanation."""
-    })
+Return ONLY the JSON. No markdown. No explanation. No code fences."""
 
-    response = client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": content}]
-    )
+    # Build parts: images + text prompt
+    parts = []
+    for img_bytes in image_bytes_list:
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/png",
+                "data": base64.b64encode(img_bytes).decode("utf-8")
+            }
+        })
+    parts.append({"text": prompt})
 
-    raw = response.content[0].text.strip()
+    response = model.generate_content({"parts": parts})
+
+    raw = response.text.strip()
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
@@ -192,20 +180,16 @@ Return ONLY the JSON, no markdown, no explanation."""
 # ── Google Sheets helpers ────────────────────────────────────────────────────
 
 def get_gsheet_from_secret(sheet_id: str):
-    """Connect to Google Sheets using credentials from Streamlit secrets or uploaded file."""
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    # Try Streamlit secrets first (for cloud deployment)
     try:
         creds_dict = dict(st.secrets["GOOGLE_CREDENTIALS"])
-        # Fix newlines in private key
         if "private_key" in creds_dict:
             creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     except Exception:
-        # Fallback: use uploaded file path stored in session state
         creds_path = st.session_state.get("creds_path", "")
         if not creds_path or not os.path.exists(creds_path):
             raise ValueError("Google credentials not found. Please upload credentials.json in the sidebar.")
@@ -260,61 +244,43 @@ def build_excel(result: dict) -> bytes:
     thin        = Side(border_style="thin", color="AAAAAA")
     border      = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    # Summary row
     for col, h in enumerate(SHEET_HEADERS, 1):
         cell = ws.cell(row=1, column=col, value=h)
-        cell.font      = header_font
-        cell.fill      = header_fill
-        cell.alignment = center
-        cell.border    = border
+        cell.font = header_font; cell.fill = header_fill
+        cell.alignment = center; cell.border = border
 
     data_row = [
-        result["date"],
-        result["intern_name"],
-        result["topic"],
+        result["date"], result["intern_name"], result["topic"],
         result["assessment_number"],
         f"{result['total_marks']}/{result['max_marks']}",
-        f"{result['percentage']:.1f}%",
-        result["overall_feedback"],
+        f"{result['percentage']:.1f}%", result["overall_feedback"],
     ]
     for col, val in enumerate(data_row, 1):
         cell = ws.cell(row=2, column=col, value=val)
-        cell.alignment = center
-        cell.border    = border
+        cell.alignment = center; cell.border = border
 
-    # Question breakdown
     ws.cell(row=4, column=1, value="Question-wise Breakdown").font = Font(bold=True, size=12)
     q_headers = ["Q.No", "Question", "Intern's Answer", "Correct Answer", "Marks", "Feedback"]
-    q_fill    = PatternFill("solid", fgColor="2D6A9F")
     for col, h in enumerate(q_headers, 1):
         cell = ws.cell(row=5, column=col, value=h)
-        cell.font      = Font(bold=True, color="FFFFFF")
-        cell.fill      = q_fill
-        cell.alignment = center
-        cell.border    = border
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="2D6A9F")
+        cell.alignment = center; cell.border = border
 
     for i, q in enumerate(result.get("questions", []), 6):
         awarded = q.get("marks_awarded", 0)
         maximum = q.get("max_marks", 1)
-        row_vals = [
-            q.get("q_no", i - 5),
-            q.get("question", ""),
-            q.get("intern_answer", ""),
-            q.get("correct_answer", ""),
-            f"{awarded}/{maximum}",
-            q.get("feedback", ""),
-        ]
         bg = "F0FFF4" if awarded >= maximum else "FFF5F5" if awarded == 0 else "FFFBF0"
-        for col, val in enumerate(row_vals, 1):
+        for col, val in enumerate([q.get("q_no", i-5), q.get("question",""),
+                                    q.get("intern_answer",""), q.get("correct_answer",""),
+                                    f"{awarded}/{maximum}", q.get("feedback","")], 1):
             cell = ws.cell(row=i, column=col, value=val)
             cell.alignment = Alignment(wrap_text=True, vertical="top")
-            cell.border    = border
-            cell.fill      = PatternFill("solid", fgColor=bg)
+            cell.border = border
+            cell.fill = PatternFill("solid", fgColor=bg)
 
-    col_widths = [8, 40, 35, 35, 10, 40]
-    for col, w in enumerate(col_widths, 1):
+    for col, w in enumerate([8, 40, 35, 35, 10, 40], 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
-    ws.row_dimensions[2].height = 30
 
     out = io.BytesIO()
     wb.save(out)
@@ -322,19 +288,19 @@ def build_excel(result: dict) -> bytes:
 
 
 # ════════════════════════════════════════════════════════════════════
-#  SIDEBAR — CONFIGURATION
+#  SIDEBAR
 # ════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/graduation-cap.png", width=80)
     st.title("⚙️ Configuration")
 
-    st.subheader("🔑 API Keys")
+    st.subheader("🔑 Gemini API Key")
     api_key_input = st.text_input(
-        "Anthropic API Key",
-        value=ANTHROPIC_API_KEY,
+        "Google Gemini API Key",
+        value=GEMINI_API_KEY,
         type="password",
-        help="Get your key at console.anthropic.com",
+        help="Get your key at: aistudio.google.com/app/apikey",
     )
 
     st.subheader("📊 Google Sheets")
@@ -344,13 +310,8 @@ with st.sidebar:
         help="Found in the Sheet URL: /spreadsheets/d/<SHEET_ID>/",
     )
 
-    st.info("💡 On Streamlit Cloud, credentials are read from **Secrets** automatically. Upload below only for local use.")
-    creds_file = st.file_uploader(
-        "Upload credentials.json (local use only)",
-        type="json",
-        help="Google Service Account JSON key file",
-    )
-
+    st.info("💡 On Streamlit Cloud, credentials are read from **Secrets** automatically.")
+    creds_file = st.file_uploader("Upload credentials.json (local only)", type="json")
     if creds_file:
         creds_path = "/tmp/uploaded_credentials.json"
         with open(creds_path, "wb") as f:
@@ -359,15 +320,7 @@ with st.sidebar:
         st.success("✅ credentials.json loaded")
 
     st.divider()
-    st.markdown("### 📌 How to use")
-    st.markdown("""
-1. Add your **API key** & **Sheet ID** in Secrets
-2. Upload a **scanned PDF** assessment
-3. Click **Grade Assessment**
-4. Download the **Excel report**
-""")
-    st.divider()
-    st.caption("Built with ❤️ using Claude AI + Streamlit")
+    st.caption("Built with ❤️ using Gemini AI + Streamlit")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -377,64 +330,45 @@ with st.sidebar:
 st.markdown("""
 <div class="main-header">
     <h1>📝 Assessment Auto-Grader</h1>
-    <p>Upload a scanned PDF → AI extracts & grades → Saves to Google Sheets</p>
+    <p>Upload a scanned PDF → Gemini AI extracts & grades → Saves to Google Sheets</p>
 </div>
 """, unsafe_allow_html=True)
 
 col1, col2 = st.columns([2, 1])
-
 with col1:
-    uploaded_pdf = st.file_uploader(
-        "📂 Upload Scanned Assessment PDF",
-        type=["pdf"],
-        help="Scanned or digital PDF of the intern's assessment answer sheet",
-    )
-
+    uploaded_pdf = st.file_uploader("📂 Upload Scanned Assessment PDF", type=["pdf"])
 with col2:
     st.markdown("### ℹ️ Requirements")
-    st.info("""
-- PDF can be scanned / handwritten
-- Should contain: **Name**, **Date**, **Topic**, **Assessment No.**, **Q&A**
-- Duplicate entries are automatically blocked
-""")
+    st.info("PDF can be scanned/handwritten. Should contain **Name**, **Date**, **Topic**, **Assessment No.** and **Q&A**. Duplicates are blocked automatically.")
 
 if uploaded_pdf:
     st.markdown("---")
     if st.button("🚀 Grade This Assessment", use_container_width=True):
 
-        # Validate config
         missing = []
-        if not api_key_input:  missing.append("Anthropic API Key")
+        if not api_key_input:  missing.append("Gemini API Key")
         if not sheet_id_input: missing.append("Google Sheet ID")
-
         if missing:
-            st.markdown(f'<div class="error-card">❌ Missing configuration: <b>{", ".join(missing)}</b>. Please add them in the sidebar or Streamlit Secrets.</div>',
-                        unsafe_allow_html=True)
+            st.markdown(f'<div class="error-card">❌ Missing: <b>{", ".join(missing)}</b></div>', unsafe_allow_html=True)
             st.stop()
 
         pdf_bytes = uploaded_pdf.read()
 
-        # Step 1 — Convert PDF to images
         with st.spinner("📄 Converting PDF pages to images…"):
             try:
-                images_b64 = pdf_to_base64_images(pdf_bytes)
-                st.success(f"✅ Converted {len(images_b64)} page(s)")
+                image_bytes_list = pdf_to_images(pdf_bytes)
+                st.success(f"✅ Converted {len(image_bytes_list)} page(s)")
             except Exception as e:
-                st.error(f"Failed to read PDF: {e}")
-                st.stop()
+                st.error(f"Failed to read PDF: {e}"); st.stop()
 
-        # Step 2 — Claude AI extraction + grading
-        with st.spinner("🤖 Claude AI is reading and grading the assessment… (this may take 20–40 sec)"):
+        with st.spinner("🤖 Gemini AI is reading and grading… (20–40 sec)"):
             try:
-                result = extract_and_grade_with_claude(images_b64, api_key_input)
+                result = extract_and_grade_with_gemini(image_bytes_list, api_key_input)
             except json.JSONDecodeError as e:
-                st.error(f"AI returned invalid JSON. Try re-uploading a clearer scan. Details: {e}")
-                st.stop()
+                st.error(f"AI returned invalid JSON. Try a clearer scan. Details: {e}"); st.stop()
             except Exception as e:
-                st.error(f"Claude API error: {e}")
-                st.stop()
+                st.error(f"Gemini API error: {e}"); st.stop()
 
-        # Step 3 — Display extracted info
         st.markdown("## 📋 Extracted Information")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("👤 Name",       result.get("intern_name", "Unknown"))
@@ -442,76 +376,56 @@ if uploaded_pdf:
         m3.metric("📚 Topic",      result.get("topic", "Unknown"))
         m4.metric("🔢 Assessment", result.get("assessment_number", "Unknown"))
 
-        # Step 4 — Scoring
         st.markdown("## 📊 Score")
         s1, s2, s3 = st.columns(3)
-        s1.metric("Marks Awarded", f"{result.get('total_marks', 0)} / {result.get('max_marks', 0)}")
-        s2.metric("Percentage",    f"{result.get('percentage', 0):.1f}%")
+        s1.metric("Marks Awarded", f"{result.get('total_marks',0)} / {result.get('max_marks',0)}")
+        s2.metric("Percentage",    f"{result.get('percentage',0):.1f}%")
         pct   = result.get("percentage", 0)
-        grade = "A+" if pct >= 90 else "A" if pct >= 80 else "B" if pct >= 70 else \
-                "C"  if pct >= 60 else "D" if pct >= 50 else "F"
+        grade = "A+" if pct>=90 else "A" if pct>=80 else "B" if pct>=70 else "C" if pct>=60 else "D" if pct>=50 else "F"
         s3.metric("Grade", grade)
 
         st.markdown("### 💬 Overall Feedback")
         st.info(result.get("overall_feedback", "No feedback generated."))
 
-        # Step 5 — Question breakdown
         st.markdown("## 📝 Question-wise Breakdown")
         for q in result.get("questions", []):
             awarded = q.get("marks_awarded", 0)
             maximum = q.get("max_marks", 1)
-            icon    = "✅" if awarded >= maximum else "⚠️" if awarded > 0 else "❌"
+            icon = "✅" if awarded >= maximum else "⚠️" if awarded > 0 else "❌"
             with st.expander(f"{icon} Q{q.get('q_no','?')} — {str(q.get('question',''))[:80]}... | {awarded}/{maximum} marks"):
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown("**Intern's Answer:**")
-                    st.write(q.get("intern_answer", "—"))
+                    st.markdown("**Intern's Answer:**"); st.write(q.get("intern_answer","—"))
                 with c2:
-                    st.markdown("**Correct Answer:**")
-                    st.write(q.get("correct_answer", "—"))
-                st.markdown(f"**Feedback:** {q.get('feedback', '—')}")
+                    st.markdown("**Correct Answer:**");  st.write(q.get("correct_answer","—"))
+                st.markdown(f"**Feedback:** {q.get('feedback','—')}")
 
-        # Step 6 — Google Sheets
         st.markdown("## 💾 Saving to Google Sheets")
         try:
-            ws         = get_gsheet_from_secret(sheet_id_input)
+            ws = get_gsheet_from_secret(sheet_id_input)
             ensure_headers(ws)
             name       = result.get("intern_name", "Unknown")
             assessment = result.get("assessment_number", "Unknown")
-
             if is_duplicate(ws, name, assessment):
-                st.markdown(
-                    f'<div class="warning-card">⚠️ <b>Duplicate detected!</b> '
-                    f'<i>{name}</i> already has a record for <i>{assessment}</i>. '
-                    f'Not saved to Google Sheets.</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div class="warning-card">⚠️ <b>Duplicate!</b> {name} — {assessment} already exists. Not saved.</div>', unsafe_allow_html=True)
             else:
                 append_to_sheet(ws, result)
-                st.markdown(
-                    '<div class="success-card">✅ Result saved to Google Sheets successfully!</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown('<div class="success-card">✅ Saved to Google Sheets!</div>', unsafe_allow_html=True)
         except Exception as e:
             st.warning(f"⚠️ Google Sheets skipped: {e}")
 
-        # Step 7 — Excel download
         st.markdown("## ⬇️ Download Excel Report")
         excel_bytes = build_excel(result)
         safe_name   = re.sub(r"[^a-zA-Z0-9_]", "_", result.get("intern_name", "assessment"))
         filename    = f"{safe_name}_{result.get('assessment_number','result').replace(' ','_')}.xlsx"
-        st.download_button(
-            label="📥 Download Detailed Excel Report",
-            data=excel_bytes,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        st.download_button("📥 Download Detailed Excel Report", data=excel_bytes,
+                           file_name=filename,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True)
 
-# ── View all records ─────────────────────────────────────────────────────────
 st.markdown("---")
-st.markdown("## 📊 View All Records from Google Sheets")
-if st.button("🔄 Load Records", use_container_width=True):
+st.markdown("## 📊 View All Records")
+if st.button("🔄 Load Records from Google Sheets", use_container_width=True):
     try:
         ws      = get_gsheet_from_secret(sheet_id_input)
         records = ws.get_all_records()
@@ -521,21 +435,12 @@ if st.button("🔄 Load Records", use_container_width=True):
             st.caption(f"Total records: {len(df)}")
             out = io.BytesIO()
             df.to_excel(out, index=False)
-            st.download_button(
-                "📥 Download All Records as Excel",
-                data=out.getvalue(),
-                file_name="all_assessments.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            st.download_button("📥 Download All as Excel", data=out.getvalue(),
+                               file_name="all_assessments.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
-            st.info("No records found in the sheet yet.")
+            st.info("No records yet.")
     except Exception as e:
         st.error(f"Could not load records: {e}")
 
-st.markdown("---")
-st.markdown(
-    "<p style='text-align:center; color:#888; font-size:0.85rem;'>"
-    "Assessment Auto-Grader · Powered by Claude AI · Built with Streamlit"
-    "</p>",
-    unsafe_allow_html=True,
-)
+st.markdown("<p style='text-align:center;color:#888;font-size:0.85rem;'>Assessment Auto-Grader · Powered by Gemini AI · Built with Streamlit</p>", unsafe_allow_html=True)
