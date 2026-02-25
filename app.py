@@ -18,10 +18,10 @@ from PIL import Image
 # ── Load environment variables ──────────────────────────────────────────────
 load_dotenv()
 
-ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY", "")
-GOOGLE_SHEET_ID      = os.getenv("GOOGLE_SHEET_ID", "")
-GOOGLE_CREDS_PATH    = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+import streamlit as st
 
+ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", os.getenv("ANTHROPIC_API_KEY", ""))
+GOOGLE_SHEET_ID   = st.secrets.get("GOOGLE_SHEET_ID",   os.getenv("GOOGLE_SHEET_ID", ""))
 SHEET_HEADERS = ["Date", "Name", "Topic", "Assessment", "Marks", "Percentage", "Feedback/Remarks"]
 
 # ── Page config ──────────────────────────────────────────────────────────────
